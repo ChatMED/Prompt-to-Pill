@@ -205,5 +205,4 @@ async def predict_trial_success(trial_text: str) -> str:
         return json.dumps({"error": str(e)})
 
 if __name__ == "__main__":
-    print("🚀 Combined FastMCP server starting on port 8000", flush=True)
     mcp.run(transport="streamable-http")
