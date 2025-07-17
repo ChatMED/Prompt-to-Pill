@@ -92,9 +92,10 @@ async def main():
     druggen_params = StdioServerParams(command="python", args=["druggen_mcp_server.py"], read_timeout_seconds=1000)
     docking_params = StdioServerParams(command="python", args=["docking_mcp_server.py"], read_timeout_seconds=2000)
     cloud_parms = StreamableHttpServerParams(
-        url="https://60fe2e609582.ngrok-free.app/mcp",
+        url="https://your-ngrok-url.ngrok-free.app/mcp",
         timeout=1000,
-        headers={"ngrok-skip-browser-warning": "true"}
+        headers={"ngrok-skip-browser-warning": "true"},
+        sse_read_timeout=500.00
     )
     logger.info("MCP Server parameters defined.")
 
@@ -117,20 +118,23 @@ async def main():
     docking_tools = []
     txgemma_tools = []
     meditab_tools = []
+    panacea_tools = []
     try:
         logger.info("Attempting to load tools from MCP servers...")
         druggen_tools = await mcp_server_tools(druggen_params)
         docking_tools = await mcp_server_tools(docking_params)
         cloud_tools = await mcp_server_tools(cloud_parms)
         txgemma_tools = [t for t in cloud_tools if t.name in ["predict_properties", "toxicity_screening"]]
-        meditab_tools = [t for t in cloud_tools if t.name in ["match_patient_trial", "predict_trial_success"]]
+        meditab_tools = [t for t in cloud_tools if t.name in ["predict_trial_success"]]
+        panacea_tools = [t for t in cloud_tools if t.name in ["match_patient_trial"]]
 
         logger.info(f"Loaded {len(druggen_tools)} tools from Druggen server.")
         logger.info(f"Loaded {len(docking_tools)} tools from Docking server.")
         logger.info(f"Loaded {len(txgemma_tools)} tools from TxGemma server.")
         logger.info(f"Loaded {len(meditab_tools)} tools from Meditab server.")
+        logger.info(f"Loaded {len(panacea_tools)} tools from Panacea server.")
 
-        if not druggen_tools or not docking_tools or not txgemma_tools or not meditab_tools:
+        if not druggen_tools or not docking_tools or not txgemma_tools or not meditab_tools or not panacea_tools:
             raise ValueError("One or more MCP servers returned no tools (or empty list). Ensure all tools are exposed.")
 
     except Exception as e:
@@ -243,44 +247,68 @@ async def main():
                 "If the input is invalid or missing critical information, return: {'error': 'Invalid input for summary', 'completed': false}."
             )
         ),
-        "trial_generator_agent": AssistantAgent(
+       "trial_generator_agent": AssistantAgent(
             name="trial_generator_agent",
             model_client=model_client,
             system_message="""
                 You are a clinical trial design expert specializing in metabolic diseases.
-                Your task is to generate a realistic Phase I clinical trial protocol for a novel drug targeting diabetes mellitus type 2.
+                Your task is to generate a realistic Phase I clinical trial protocol for a novel drug targeting DDP4 target connected to diabetes mellitus type 2.
                 Input will be a JSON string with the format:
                 {'drug_smiles': 'SMILES_STRING', 'target_uniprot_id': 'UNIPROT_ID', 'basic_eligibility': 'ELIGIBILITY_TEXT'}
                 
-                You MUST respond with a valid JSON object containing a 'trial_protocol_text' key with the following fields:
-                - "title": Descriptive trial title.
-                - "condition": "Diabetes Mellitus Type 2"
-                - "phase": "Phase 1"
-                - "intervention": Description of the drug (referencing SMILES) and administration.
-                - "arms": List of trial arms (e.g., dose groups, placebo).
-                - "number_of_participants": Number of participants (20-100).
-                - "duration": Trial duration (e.g., "6 months").
-                - "primary_outcomes": List of safety/pharmacokinetic outcomes.
-                - "secondary_outcomes": List of exploratory outcomes.
+                You MUST respond with a valid JSON object containing a top-level key: "trial_protocol_text", whose value is an object with the following fields:
+
+                - brief_title – ≤300 characters.
+                - official_title – More descriptive trial title.
+                - condition – Clinical condition studied.
+                - study_type – Type of study (e.g., "Interventional").
+                - phase – Clinical trial phase (e.g., "Phase 1").
+                - intervention_model – Model used (e.g., "Parallel Assignment").
+                - allocation – Randomization method (e.g., "Randomized").
+                - masking – Blinding strategy (e.g., "Double-Blind").
+                - intervention_description – Description of the intervention (must reference the molecule).
+                - enrollment – Integer (between 20 and 100).
+                - arms – List of treatment arms, each with:
+                  - name
+                  - description
+                  - dose
+                - study_start_date – ISO format (e.g., "2026-03").
+                - primary_outcomes – List of primary outcome measures.
+                - secondary_outcomes – List of secondary outcome measures.
+                - eligibility_criteria – Object with two keys:
+                  - inclusion – List of inclusion criteria.
+                  - exclusion – List of exclusion criteria.
+                - summary – Summary of a trial that describes trial purpose, design, intervention, outcomes, and MUST include eligibility criteria with inclusion criteria and exclusion criteria 
                 
-                Example output:
+                Example structure:
+                
                 {
                   "trial_protocol_text": {
-                    "title": "Phase I Trial of Novel Drug for Type 2 Diabetes",
-                    "condition": "Diabetes Mellitus Type 2",
-                    "phase": "Phase 1",
-                    "intervention": "Drug (SMILES: [SMILES]) administered orally at escalating doses.",
+                    "brief_title": "...",
+                    "official_title": "...",
+                    "condition": "...",
+                    "study_type": "...",
+                    "phase": "...",
+                    "intervention_model": "...",
+                    "allocation": "...",
+                    "masking": "...",
+                    "intervention_description": "...",
+                    "enrollment": ...,
                     "arms": [
-                      {"name": "Dose Group 1", "dose": "2.5 mg"},
-                      {"name": "Placebo", "dose": "Matching placebo"}
+                      { "name": "...", "description": "...", "dose": "..." },
+                      { "name": "...", "description": "...", "dose": "..." }
                     ],
-                    "number_of_participants": 40,
-                    "duration": "6 months",
-                    "primary_outcomes": ["Safety (adverse events)", "Pharmacokinetics (Cmax, AUC)"],
-                    "secondary_outcomes": ["Exploratory HbA1c reduction"]
+                    "study_start_date": "...",
+                    "primary_outcomes": ["...", "..."],
+                    "secondary_outcomes": ["...", "..."],
+                    "eligibility_criteria": {
+                      "inclusion": ["...", "..."],
+                      "exclusion": ["...", "..."]
+                    },
+                    "summary": "..."
                   }
                 }
-                
+                                    
                 If input is invalid, return:
                 {'error': 'Invalid input for trial protocol generation', 'retry': true}
                 
@@ -288,18 +316,17 @@ async def main():
             """
         ),
         "patient_matching_agent": AssistantAgent(
-        name="patient_matching_agent",
-        model_client=model_client,
-        tools=meditab_tools,
-        system_message=(
-            "You are the patient-trial matching agent.\n"
-            "Your input is a JSON string: {'xml_path': 'STRING', 'trial_text': 'STRING'}.\n"
-            "You MUST call the 'match_patient_trial' tool with 'xml_path' and 'trial_text' as arguments.\n"
-            "Return ONLY the tool's JSON output without any additional text.\n"
-            "If the tool fails or returns no output, return: {'error': 'Cannot match patients', 'retry': true}\n"
-        )
-    ),
-
+            name="patient_matching_agent",
+            model_client=model_client,
+            tools=panacea_tools,
+            system_message=(
+                "You are the patient-trial matching agent.\n"
+                "Your input is a JSON string: {'xml_path': 'STRING', 'trial_summary': 'STRING', 'outfile': 'STRING (optional)'}.\n"
+                "You MUST call the 'match_patient_trial' tool with 'xml_path' and 'trial_summary' as arguments.\n"
+                "Return ONLY the tool's JSON output without any additional text.\n"
+                "If the tool fails or returns no output, return: {'error': 'Cannot match patients', 'retry': true}\n"
+            )
+        ),
         "trial_outcome_prediction_agent": AssistantAgent(
             name="trial_outcome_prediction_agent",
             model_client=model_client,
@@ -312,7 +339,7 @@ async def main():
                 "If the tool fails, return: {'error': 'Cannot predict trial outcome', 'retry': true}\n"
                 "Do NOT include any other text."
             )
-    ),
+        ),
         "clinical_report_generator_agent": AssistantAgent(
             name="clinical_report_generator_agent",
             model_client=model_client,
