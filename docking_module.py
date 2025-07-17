@@ -1,151 +1,114 @@
-import os
-import subprocess
+import os, sys, subprocess, requests
+from typing import Tuple, Optional
 from rdkit import Chem
 from rdkit.Chem import AllChem
-import requests
-from io import StringIO
 
-def dock_with_vina(uniprot_id: str, drug_smiles: str) -> float:
-    protein_pdb = get_alphafold_structure(uniprot_id)
-    if not protein_pdb:
-        print(f"Could not retrieve structure for {uniprot_id}")
-        return 0.0
+CHAIN = "A"
+BOX_PAD = 4.0
+BOX_MIN = 18.0
+EXH = 4
 
-    ligand_pdbqt = prepare_ligand_from_smiles(drug_smiles)
-    if not ligand_pdbqt:
-        print("Could not prepare ligand")
-        return 0.0
+PDBe_BEST = "https://www.ebi.ac.uk/pdbe/graph-api/mappings/best_structures/{}"
+RCSB_PDB = "https://files.rcsb.org/download/{}.pdb"
+AF_URL = "https://alphafold.ebi.ac.uk/files/AF-{}-F1-model_v4.pdb"
 
-    receptor_pdbqt = prepare_receptor(protein_pdb)
 
-    binding_affinity = run_vina_docking(receptor_pdbqt, ligand_pdbqt)
-
-    return binding_affinity
-
-def get_alphafold_structure(uniprot_id: str) -> str:
-    url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
-
+def get_structure(uniprot: str) -> Tuple[str, str, Optional[str]]:
+    uni = uniprot.upper()
     try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(f"{uniprot_id}.pdb", "w") as f:
-                f.write(response.text)
-            return f"{uniprot_id}.pdb"
-        else:
-            print(f"AlphaFold structure not available for {uniprot_id}")
-            return None
-    except Exception as e:
-        print(f"Error downloading structure: {e}")
-        return None
-def prepare_ligand_from_smiles(smiles: str) -> str:
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, randomSeed=42)
-    AllChem.MMFFOptimizeMolecule(mol)
-
-    writer = Chem.SDWriter("ligand.sdf")
-    writer.write(mol)
-    writer.close()
-
-    try:
-        cmd = ["obabel", "-isdf", "ligand.sdf", "-opdbqt", "-O", "ligand.pdbqt", "--partialcharge", "gasteiger"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode == 0 and os.path.exists("ligand.pdbqt"):
-            return "ligand.pdbqt"
-        else:
-            print(f"OpenBabel error: {result.stderr}")
-            return None
-
-    except Exception as e:
-        print(f"Error preparing ligand: {e}")
-        return None
-
-def prepare_receptor(pdb_file: str) -> str:
-    try:
-        cmd = ["obabel", "-ipdb", pdb_file, "-opdbqt", "-O", "receptor.pdbqt",
-               "-xr", "--partialcharge", "gasteiger"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode == 0 and os.path.exists("receptor.pdbqt"):
-            return "receptor.pdbqt"
-        else:
-            print(f"OpenBabel receptor error: {result.stderr}")
-            return None
-
-    except Exception as e:
-        print(f"Error preparing receptor: {e}")
-        return None
-
-def convert_pdb_to_pdbqt(pdb_content: str) -> str:
-    lines = pdb_content.split('\n')
-    pdbqt_lines = []
-
-    for line in lines:
-        if line.startswith('ATOM') or line.startswith('HETATM'):
-            if len(line) >= 78:
-                atom_type = line[76:78].strip()
-                charge = "0.000"
-                pdbqt_line = line[:70] + f"{charge:>6}" + f"{atom_type:>2}"
-                pdbqt_lines.append(pdbqt_line)
-
-    return '\n'.join(pdbqt_lines)
+        best = requests.get(PDBe_BEST.format(uni), timeout=10).json()[uni][0]
+        pdb_id = best["pdb_id"].upper()
+        pdb_path = f"{pdb_id}.pdb"
+        if not os.path.exists(pdb_path):
+            open(pdb_path, "w").write(requests.get(RCSB_PDB.format(pdb_id), timeout=10).text)
+        lig_resn = None
+        with open(pdb_path) as fh:
+            for ln in fh:
+                if ln.startswith("HETATM") and ln[21]==CHAIN and ln[17:20].strip() not in {"HOH", "HOH", "SO4", "NAG", "NDG", "NA"}:
+                    lig_resn = ln[17:20].strip(); break
+        return pdb_path, pdb_id, lig_resn
+    except Exception:
+        pdb_path = f"{uni}_AF.pdb"
+        if not os.path.exists(pdb_path):
+            open(pdb_path, "w").write(requests.get(AF_URL.format(uni), timeout=10).text)
+        print(f"✓ AlphaFold model for {uni}")
+        return pdb_path, f"AF_{uni}", None
 
 
-def run_vina_docking(receptor_pdbqt: str, ligand_pdbqt: str) -> float:
-    center_x, center_y, center_z = 31.724, -22.0063, -17.132
-    size_x, size_y, size_z = 30, 30, 30
+def split_receptor_ligand(pdb_in: str, lig_resn: str | None) -> Tuple[str, Optional[str]]:
+    rec, lig = "receptor_raw.pdb", "ligand_ref.pdb"
+    ligand_found = False
+    if lig_resn:
+        with open(lig, "w") as L, open(pdb_in) as src:
+            for ln in src:
+                if ln.startswith("HETATM") and ln[17:20].strip()==lig_resn and ln[21]==CHAIN:
+                    L.write(ln); ligand_found = True
+            L.write("END\n")
+    if not ligand_found:
+        lig = None
+    with open(rec, "w") as R, open(pdb_in) as src:
+        for ln in src:
+            if ln.startswith("ATOM") and ln[21]==CHAIN:
+                R.write(ln)
+        R.write("END\n")
+    return rec, lig
 
-    vina_cmd = [
-        "vina",
-        "--receptor", receptor_pdbqt,
-        "--ligand", ligand_pdbqt,
-        "--center_x", str(center_x),
-        "--center_y", str(center_y),
-        "--center_z", str(center_z),
-        "--size_x", str(size_x),
-        "--size_y", str(size_y),
-        "--size_z", str(size_z),
-        "--out", "docked.pdbqt"
-    ]
+def grid_from_file(pdb: str):
+    xs=ys=zs=[]
+    xs,ys,zs=[],[],[]
+    for ln in open(pdb):
+        skip_resns = {"HOH", "SO4", "NAG", "NDG", "NA"}
+        resn = ln[17:20].strip()
+        if ln.startswith("HETATM") and ln[21] == CHAIN and resn not in skip_resns:
+            xs.append(float(ln[30:38])); ys.append(float(ln[38:46])); zs.append(float(ln[46:54]))
+    cx,cy,cz = sum(xs)/len(xs), sum(ys)/len(ys), sum(zs)/len(zs)
+    s = max(BOX_MIN, max(xs)-min(xs)+2*BOX_PAD, max(ys)-min(ys)+2*BOX_PAD, max(zs)-min(zs)+2*BOX_PAD)
+    return cx,cy,cz,s
 
-    try:
-        result = subprocess.run(vina_cmd, capture_output=True, text=True, timeout=300)
+def obabel_pdbqt(pdb: str, out: str, is_lig: bool):
+    cmd=["obabel","-ipdb",pdb,"-opdbqt","-O",out,"--partialcharge","gasteiger"]
+    if not is_lig: cmd.extend(["-xh","-xr"])
+    subprocess.run(cmd, check=True, capture_output=True)
 
-        if result.returncode == 0:
-            output = result.stdout
+def smiles_to_pdbqt(smiles: str) -> str:
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    AllChem.EmbedMolecule(mol, randomSeed=42); AllChem.MMFFOptimizeMolecule(mol)
+    Chem.SDWriter("ligand_tmp.sdf").write(mol)
+    subprocess.run(["obabel","-isdf","ligand_tmp.sdf","-opdbqt","-O","ligand_gen.pdbqt","--partialcharge","gasteiger"], check=True)
+    return "ligand_gen.pdbqt"
 
-            for line in output.split('\n'):
-                if 'REMARK VINA RESULT:' in line:
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if part == 'RESULT:' and i + 1 < len(parts):
-                            try:
-                                return float(parts[i + 1])
-                            except ValueError:
-                                continue
+def run_vina(rec_pqt: str, lig_pqt: str, cx: float, cy: float, cz: float, box: float) -> float:
+    cmd=["vina",
+         "--receptor",rec_pqt,
+         "--ligand",lig_pqt,
+         "--center_x",str(cx),
+         "--center_y",str(cy),
+         "--center_z",str(cz),
+         "--size_x",str(box),
+         "--size_y",str(box),
+         "--size_z",str(box),
+         "--exhaustiveness",str(EXH),
+         "--cpu","1"]
+    out=subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+    for ln in out.splitlines():
+        if ln.strip().startswith("1 "):
+            return float(ln.split()[1])
+    return 0.0
 
-            if os.path.exists("docked.pdbqt"):
-                with open("docked.pdbqt", "r") as f:
-                    for line in f:
-                        if line.startswith("REMARK VINA RESULT:"):
-                            parts = line.split()
-                            if len(parts) >= 4:
-                                try:
-                                    return float(parts[3])
-                                except ValueError:
-                                    continue
+def dock_with_vina(uniprot: str, smiles: str="") -> float:
+    pdb_path, pdb_id, lig_resn = get_structure(uniprot)
+    rec_pdb, lig_pdb = split_receptor_ligand(pdb_path, lig_resn)
 
-            print("Could not parse binding affinity from output")
-            return 0.0
-        else:
-            print(f"Vina failed: {result.stderr}")
-            return 0.0
+    if lig_pdb is None and smiles == "":
+        sys.exit("No ligand on chain A; please supply SMILES.")
 
-    except Exception as e:
-        print(f"Error running Vina: {e}")
-        return 0.0
+    grid_ref = lig_pdb if lig_pdb else pdb_path
+    cx,cy,cz,box = grid_from_file(grid_ref)
 
+    obabel_pdbqt(rec_pdb, "receptor.pdbqt", is_lig=False)
+    lig_pqt = smiles_to_pdbqt(smiles) if smiles else "ligand_ref.pdbqt"
+    if smiles == "":
+        obabel_pdbqt(lig_pdb, lig_pqt, is_lig=True)
+
+    score = run_vina("receptor.pdbqt", lig_pqt, cx,cy,cz, box)
+    return score
