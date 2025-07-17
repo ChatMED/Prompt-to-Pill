@@ -223,38 +223,47 @@ class DrugDiscoveryOrchestrator:
 
                 arms_string = ', '.join([f"{arm['name']} ({arm['dose']})" for arm in trial_protocol_dict['arms']])
 
+                trial_summary = trial_protocol_dict.get("summary", "")
+
                 trial_text_for_outcome = (
-                    f"{trial_protocol_dict['title']}. "
+                    f"{trial_protocol_dict['brief_title']}. "
                     f"{trial_protocol_dict['condition']}. "
                     f"{trial_protocol_dict['phase']}. "
-                    f"{trial_protocol_dict['intervention']}. "
+                    f"{trial_protocol_dict['intervention_description']}. "
                     f"Arms: {arms_string}. "
-                    f"Number of participants: {trial_protocol_dict['number_of_participants']}. "
-                    f"Duration: {trial_protocol_dict['duration']}. "
+                    f"Enrollment: {trial_protocol_dict['enrollment']}. "
+                    f"Start date: {trial_protocol_dict['study_start_date']}. "
                     f"Primary outcomes: {', '.join(trial_protocol_dict['primary_outcomes'])}. "
-                    f"Secondary outcomes: {', '.join(trial_protocol_dict['secondary_outcomes'])}."
+                    f"Secondary outcomes: {', '.join(trial_protocol_dict['secondary_outcomes'])}.\n\n"
+                    f"Summary: {trial_summary}"
                 )
 
                 match_patient_trial_output = await self._run_agent_step(
                     "patient_matching_agent",
                     json.dumps({
                         "xml_path": normalized_patient_path,
-                        "trial_text": trial_text_for_outcome
+                        "trial_summary": trial_summary,
+                        "outfile": "/path/to/result/file.json"
                     }),
                     cancellation_token
                 )
 
-                if match_patient_trial_output.get("error") or not match_patient_trial_output.get("match_probability"):
-                    logger.warning(f"Patient matching failed: {match_patient_trial_output.get('error')}")
-                    workflow_failed = True
+                if match_patient_trial_output.get("error"):
+                    logger.warning(f"Patient matching failed: {match_patient_trial_output['error']}")
+                    workflow_failed_this_attempt = True
                     continue
 
-                patient_trial_pairs = match_patient_trial_output.get("match_probability")
-                if not isinstance(patient_trial_pairs, list) or not patient_trial_pairs:
-                    logger.warning("Patient-trial pairs are empty or invalid.")
-                    workflow_failed = True
+                matches = match_patient_trial_output.get("matches", [])
+                matched_patients_count = match_patient_trial_output.get("matched_patients_count", 0)
+                total_patients_parsed = match_patient_trial_output.get("total_patients_parsed", len(matches))
+                matched_patients_file = match_patient_trial_output.get("matched_patients_file")
+
+                if not matches:
+                    logger.warning("Patient-matching agent returned no eligible patients.")
+                    workflow_failed_this_attempt = True
                     continue
-                logger.info(f"Generated {len(patient_trial_pairs)} patient-trial pairs with match probabilities.")
+
+                logger.info(f"Found {matched_patients_count} matched patients out of {total_patients_parsed}.")
 
                 predict_trial_outcome_output = await self._run_agent_step(
                     "trial_outcome_prediction_agent",
@@ -282,14 +291,10 @@ class DrugDiscoveryOrchestrator:
 
                 logger.info(f"Trial outcome predicted with success probability: {success_probability:.2f}")
 
-                total_patients_parsed = len(patient_trial_pairs)
-                matched_patients_count = sum(1 for p in patient_trial_pairs if p.get("match_probability", 0) > 0.5)
-                top_matches = sorted(patient_trial_pairs, key=lambda x: x.get("match_probability", 0), reverse=True)[:5]
-
                 patient_summary = {
                     "total_patients_parsed": total_patients_parsed,
                     "matched_patients_count": matched_patients_count,
-                    "top_matches": top_matches
+                    "matched_patients_file": matched_patients_file
                 }
 
                 trial_outcome = {
