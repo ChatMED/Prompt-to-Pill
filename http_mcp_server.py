@@ -40,32 +40,53 @@ predict_model = AutoModelForCausalLM.from_pretrained(
 meditab_model = BertTabClassifier.from_pretrained("dmis-lab/biobert-base-cased-v1.2")
 meditab_tokenizer = BertTabTokenizer.from_pretrained("dmis-lab/biobert-base-cased-v1.2")
 
+PANACEA_MODEL   = "linjc16/Panacea-7B-Chat"
+PANACEA_CACHE   = os.getenv("PANACEA_CACHE", "/tmp/panacea_cache")
+
+panacea_tokenizer = AutoTokenizer.from_pretrained(
+    PANACEA_MODEL, cache_dir=PANACEA_CACHE, padding_side="left"
+)
+if panacea_tokenizer.pad_token is None:
+    panacea_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+panacea_tokenizer.model_max_length = 1000000000000000019884624838656
+
+panacea_model = AutoModelForCausalLM.from_pretrained(
+    PANACEA_MODEL,
+    cache_dir=PANACEA_CACHE,
+    device_map="auto",
+    torch_dtype=torch.float16,
+    quantization_config=BitsAndBytesConfig(load_in_4bit=True),
+)
+panacea_model.eval()
+result_cache = {}
+
 def txgemma_predict(prompt: str, max_new_tokens=16) -> str:
     input_ids = predict_tokenizer(prompt, return_tensors="pt").to(predict_model.device)
     outputs = predict_model.generate(**input_ids, max_new_tokens=max_new_tokens)
     return predict_tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def load_patients_from_xml(xml_path: str) -> pd.DataFrame:
-    tree = ET.parse(xml_path)
+def parse_xml_patients(xml_file, num_patients=3):
+    tree = ET.parse(xml_file)
     root = tree.getroot()
-    rows = []
-    for topic in root.findall("topic"):
-        pid = topic.attrib["number"]
-        text = topic.findtext("text_version") or topic.findtext("expanded")
-        rows.append({
-            "pid": pid,
-            "sentence": text.strip() if text else "",
-            "label": 0
-        })
-    return pd.DataFrame(rows)
+    patients = []
+    for topic in root.findall('.//topic'):
+        topic_number = topic.get('number')
+        text_version = topic.find('text_version').text
+        patients.append({'topic_number': topic_number, 'text_version': text_version})
+    return patients
 
-def build_patient_trial_pairs(patients_df: pd.DataFrame, trial_text: str) -> pd.DataFrame:
-    return pd.DataFrame({
-        "pid": patients_df["pid"],
-        "sentence_patient": patients_df["sentence"],
-        "sentence_trial": [trial_text]*len(patients_df),
-        "label": 0
-    })
+def build_panacea_prompt(patient_note: str, trial_summary: str) -> str:
+    return (
+        f"Hello. You are a helpful assistant for clinical trial recruitment. Your task is to compare a given patient note and the inclusion criteria of a clinical trial to determine the patient's eligibility. "
+        f"The factors that allow someone to participate in a clinical study are called inclusion criteria. They are based on characteristics such as age, gender, the type and stage of a disease, previous treatment history, and other medical conditions.\n\n"
+        f"The assessment of eligibility has a three-point scale: 0) Excluded (patient meets inclusion criteria, but is excluded on the grounds of the trial's exclusion criteria); "
+        f"1) Not relevant (patient does not have sufficient information to qualify for the trial); 2) Eligible (patient meets inclusion criteria and exclusion criteria do not apply). "
+        f"You should make a trial-level eligibility on each patient for the clinical trial, i.e., output the scale for the assessment of eligibility.\n\n"
+        f"Here is the patient note:\n{patient_note}\n\n"
+        f"Here is the clinical trial:\n{trial_summary}\n\n"
+        f"Let's think step by step.\n"
+        f"Finally, you should always repeat Trial-level eligibility in the last line by `Trial-level eligibility: `, e.g., `Trial-level eligibility: 2) Eligible.`."
+    )
 
 def build_trial_csv(trial_text: str) -> pd.DataFrame:
     return pd.DataFrame({
@@ -146,36 +167,66 @@ def toxicity_screening(smiles_list: List[str]) -> dict:
     return {"non_toxic_smiles": non_toxic}
 
 @mcp.tool(name="match_patient_trial")
-async def match_patient_trial(xml_path: str, trial_text: str) -> str:
-    logger.info(f"match_patient_trial with xml_path={xml_path}")
-    try:
-        if not os.path.exists(xml_path):
-            return json.dumps({"error": f"XML not found: {xml_path}", "retry": True})
+async def match_patient_trial(xml_path: str, trial_summary: str, max_new_tokens: int = 1024,
+    outfile: str = "matched_patients.json") -> Dict:
+    logger.info(f"[match_patient_trial] xml={xml_path}")
 
-        patients_df = load_patients_from_xml(xml_path)
-        pairs_df = build_patient_trial_pairs(patients_df, trial_text)
+    cache_key = hashlib.sha256(f"{xml_path}:{trial_summary}".encode()).hexdigest()
+    if cache_key in result_cache:
+        logger.info("Returning cached result")
+        return result_cache[cache_key]
 
-        pairs_df["text"] = pairs_df["sentence_patient"] + " [SEP] " + pairs_df["sentence_trial"]
-        inputs = meditab_tokenizer(
-            pairs_df["text"].tolist(),
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        )
+    if not os.path.exists(xml_path):
+        return {"error": f"XML not found: {xml_path}", "retry": True}
 
-        with torch.no_grad():
-            meditab_model.eval()
-            outputs = meditab_model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"]
-            )
-            probs = torch.sigmoid(outputs.logits).squeeze().detach().numpy()
-        pairs_df["match_probability"] = probs.tolist()
-        result = pairs_df[["pid", "match_probability"]].to_dict(orient="records")
-        return json.dumps({"match_probability": result})
-    except Exception as e:
-        return json.dumps({"error": str(e), "retry": True})
+    patients = parse_xml_patients(xml_path)
+    patients_df = pd.DataFrame([
+        {"pid": p["topic_number"], "sentence": p["text_version"]}
+        for p in patients
+    ])
+
+    if patients_df.empty:
+        return {"error": "No patients found in XML", "retry": True}
+
+    matches = []
+
+    for idx, row in patients_df.iterrows():
+        prompt = build_panacea_prompt(row.sentence, trial_summary)
+        try:
+            inputs = panacea_tokenizer(
+                prompt,
+                truncation=True,
+                max_length=2048,
+                return_tensors="pt"
+            ).to(panacea_model.device)
+            with torch.no_grad():
+                outputs = panacea_model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=panacea_tokenizer.pad_token_id,
+                )
+            answer = panacea_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            if "Trial-level eligibility" in answer:
+                elig_line = answer.split("Trial-level eligibility:")[-1].strip()
+                if elig_line.startswith("2"):
+                    matches.append({"pid": row.pid, "eligibility": elig_line})
+        except Exception as e:
+            logger.error(f"Error for patient {row.pid}: {e}")
+            continue
+
+    abs_path = os.path.abspath(outfile)
+    with open(abs_path, "w") as f:
+        json.dump(matches, f, indent=2)
+
+    result = {
+        "matched_patients_file": abs_path,
+        "total_patients_parsed": len(patients_df),
+        "matched_patients_count": len(matches),
+        "matches": matches
+    }
+    result_cache[cache_key] = result
+    return result
 
 @mcp.tool(name="predict_trial_success")
 async def predict_trial_success(trial_text: str) -> str:
