@@ -204,5 +204,4 @@ async def match_patient_trial(
     return result
 
 if __name__ == "__main__":
-    print("🚀 Patient Matching MCP server (stdio)", flush=True)
     mcp.run(transport="stdio")
