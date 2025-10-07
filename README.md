@@ -31,17 +31,25 @@ This study presents the Prompt-to-Pill Multi-Agent Pipeline, a comprehensive, mo
 
 This diagram illustrates the Prompt-to-Pill Multi-Agent Architecture, depicting the complete workflow from target input to clinical feasibility report generation. The system is task-dependent—each stage is dynamically configured by the Planning Agent, which selects and executes the appropriate agents and tools based on the specific requirements of the current task.
 
-Key Stages:
+# Key Stages:
 
 1.Target Input: The workflow begins with a UniProt ID identifying the target protein (e.g., DPP4, P27487).
+
 2.Drug Generation Agent: The Planning Agent invokes this tool to generate candidate molecules in SMILES format using the DrugGen framework.
+
 3.Docking Agent: The Planning Agent triggers the docking workflow, retrieving the receptor structure (from PDB or AlphaFold) and performing docking with AutoDock Vina using P2Rank-predicted binding pockets.
+
 4.Chemical & ADMET Properties Agents: Depending on task context, the Planning Agent activates these tools to compute physicochemical descriptors (MW, logP, TPSA, HBD, HBA, QED) and predict ADMET profiles via ChemFM-based models. Molecules that fail drug-likeness or toxicity filters are discarded.
+
 5.Molecule Optimization Agent: When optimization is required, the Planning Agent initiates iterative refinement of selected leads using DrugAssist-based methods to enhance bioavailability, solubility, and safety while maintaining binding affinity.
+
 6.Trial Generation Agent: Once preclinical properties are validated, the Planning Agent engages this module to construct structured clinical trial protocols based on the compound and disease profile, employing Panacea for eligibility criteria, arms, and outcomes generation.
+
 7.Patient Simulation (Synthea): Synthetic EHR data are generated to simulate patient populations representing realistic clinical diversity.
+
 8.Patient-Matching Agent: The Planning Agent activates this tool to match synthetic patients to the generated trial through Panacea-based eligibility reasoning and semantic similarity analysis.
 9.Trial Outcome Prediction Agent: The MediTab-based model is called to estimate the trial success probability for the matched cohort.
+
 10.Report Generation: Finally, the Orchestrator aggregates all results—molecular properties, docking affinities, ADMET predictions, trial design, patient matching, and success probabilities—into a unified feasibility report representing the complete Prompt-to-Pill pipeline.
 
 ---
