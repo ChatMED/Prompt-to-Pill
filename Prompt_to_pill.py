@@ -1,441 +1,401 @@
 import asyncio
-import json
 import logging
-import aiohttp
-import os
-from typing import List
-from autogen_ext.models.ollama import OllamaChatCompletionClient
-from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
+from autogen_ext.models.openai import OpenAIChatCompletionClient
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.teams import SelectorGroupChat
+from autogen_agentchat.conditions import TextMentionTermination
+from autogen_agentchat.ui import Console
 from autogen_ext.tools.mcp import StdioServerParams, StreamableHttpServerParams, mcp_server_tools
-from autogen_core.tools import FunctionTool
-from Orchestrator import DrugDiscoveryOrchestrator
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    handlers=[logging.StreamHandler()])
+DRUGGEN_SYS = (
+    '''
+    You are the Drug Generation Specialist. Your purpose is to design novel SMILES based on a specified biological target.
+    You have a tool run_druggen which returns drug smiles for given target or targets. Always generate 7 molecules.
+    DO NOT in any case perform properties prediction, docking, or free text generation. 
+    Run only tool run_druggen and return its result. If SMILES is present in the task DO NOT run the tool.
+    '''
+)
 
-logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
+CHEM_PROPERTIES_SYS = (
+    '''
+    You are the Chemical Properties Specialist. Your purpose is to predict and report on the chemical properties of molecules.
+    DO NOT in any case perform trial generation, drug generation, ADMET prediction, or docking.
+    You have these tools:
+        - select_leads_from_smiles(smiles_list, n): selects n lead compounds based on Lipinski (MW <=500, logP <=5, HBD <=5, HBA <=10) and Veber (RotB <=10, TPSA <=140) rules. n is the number of compounds to select as leads.
+        - predict_pka_batch: predicts pKa values for SMILES lists.  
+        - logd_acid_batch / logd_base_batch: calculates logD for acids or bases at a given pH.  
+        - rdkit_physchem_batch: computes physicochemical descriptors (MW, logP, TPSA, HBD, HBA, RotB, QED, etc.) plus pKa and logD(acid/base).  
+        - predict_all_batch: integrates all the above, selecting the relevant logD based on acid/base flags.  
+    '''
+)
 
+ADMET_PROPERTIES_SYS = (
+    '''
+    You are the ADMET Properties Specialist. Your purpose is to predict and report on the ADMET properties of molecules.
+    DO NOT in any case generate clinical trials, drugs, or free text. Always start with chemfm_list_properties to get exact property names.
+    Select 10 most relevant ADMET properties (e.g., oral bioavailability, solubility, clearance, BBB permeability, hERG inhibition, hepatotoxicity).
+    You have these tools:
+        - get_drug_name_from_smiles(smiles): resolves a list of SMILES to PubChem CID and returns {"cid","preferred_name","synonyms","iupac_name"}. 
+                Use only when a SMILES is provided and check if names for generated smiles are available; do NOT invent names. If no CID is found, return the tool’s error message.
+        - get_smiles_from_drug_name - finds smiles from drug name. DO NOT invent name, only if drug name is available in task run this tool
+        - chemfm_list_properties: list all properties supported by the ChemFM Space.
+        - chemfm_get_description(property_name): get the ChemFM description for a property.
+        - chemfm_predict_single(smiles, property_name): predict ONE property for ONE SMILES. DO NOT take list of smiles
+        - chemfm_predict_many(smiles, properties): predict MANY properties for ONE SMILES. DO NOT take list of smiles
+        - run_docking - performs docking and returns docking scores. Can be used for selection for the best drug candidates for some target. Lower the score better is a drug candidate. 
+                Never predict docking score without running the tool. Use for initial hit filtering and re-evaluation after optimization.
+    '''
+)
 
-DEFAULT_NUM_MOLECULES = 4
-PATIENT_DATA_FILEPATH = "/path/to/patients.xml"
+MOL_OPT_SYS = (
+    '''
+    You are Molecule Optimization specialist. You have one tool:
+      - molecule_optimizer(smiles, properties, action): It takes one SMILES, one property that needs to be optimized
+    and action (increase or decrease) wanted for the property
+    Do not generate trials or drugs, do not predict properties or docking scores. Never generate free text, only return
+    the tool result it returns. Do not run if ADMET and chemical properties are not predicted and evaluated.
+    '''
+)
 
+# Unchanged
+TRIAL_SYS = (
+    """
+    You are a clinical trial design expert.
+    Your task is to generate a realistic clinical trial protocol for a drug. If the drug is generated with druggen agent, use the drug with the lowest
+    docking score. You can't predict properties, perform docking, or generate molecules. DO NOT try those tasks.
+    If a drug name is available in the task, then run it with that name. You must generate the trial with SMILES or drug name available.
+    If drug name or drug SMILES is not available, do not generate a trial.
 
-def select_best_smiles(smiles: List[str], scores: List[float]) -> str:
+    First, output the initial trial text in this format:
+- drug: SMILES (NAME if available)
 
-    if not smiles or not scores or len(smiles) != len(scores):
-        return json.dumps({"error": "Invalid input for selection", "retry": True})
+CLINICAL TRIAL:
+- acronym: string, short study name
+- brief_title: string
+- official_title: string, descriptive trial title
+- study_status: string
+- study_start_date: string, ISO format (e.g., "2026-03")
+- primary_completion_date: string, ISO format
+- completion_date: string, ISO format
+- condition: string, clinical condition studied
+- study_type: string
+- phase: string
+- enrollment: integer
+    Then, call the panacea_extract_components tool with that entire text as the trial_text parameter.
 
-    try:
-        best_index = scores.index(min(scores))
-        best_smiles = smiles[best_index]
-        best_score = scores[best_index]
+    Finally, use the tool's output to construct and output the final report in this structured format:
+- drug: SMILES (NAME if available)
 
-        result_dict = {
-            "ranked_smiles": [best_smiles],
-            "ranked_scores": [best_score]
-        }
-        return json.dumps(result_dict)
-    except Exception as e:
-        return json.dumps({"error": f"Failed to select best SMILES: {e}", "retry": True})
+CLINICAL TRIAL:
+- acronym: string, short study name
+- brief_title: string
+- official_title: string, descriptive trial title
+- study_status: string (e.g., "Recruiting", "Completed")
+- study_start_date: string, ISO format (e.g., "2026-03")
+- primary_completion_date: string, ISO format
+- completion_date: string, ISO format
+- condition: string, clinical condition studied
+- study_type: string
+- phase: string
+- intervention_model: string
+- allocation: string
+- masking: string
+- enrollment: integer
+- arms: [list from tool output arms]
+- intervention_description: string, must reference the molecule by its SMILES
+- primary_outcomes: [list from tool output outcomes]
+- secondary_outcomes: [list from tool output outcomes]
+- other_outcomes: []  # or from secondary if needed
+- eligibility_criteria: {"inclusion": [list from tool], "exclusion": [list from tool]}
+- study_documents: list of strings
+- brief_summary: string, concise description of trial purpose, design, intervention, and eligibility.
 
+    Phases rules:
+        - Phase 1: Safety First
+            The transition from laboratory testing to human trials marks a critical milestone in medical research.
+            Phase 1 represents the first time a new treatment is tested in humans, with safety as the primary concern.
+            As stated by the University of Cincinnati Medical Center:
 
-async def check_server_health(params):
+                "Phase I trials are concerned primarily with establishing a new drug's safety and dose range in about 20-100 healthy
+                volunteers."
 
-    if isinstance(params, StreamableHttpServerParams):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(params.url, headers=params.headers, timeout=10) as response:
-                    logger.debug(f"Health check for {params.url}: {response.status}")
-                    return response.status == 200
-        except Exception as e:
-            logger.warning(f"Server health check failed for {params.url}: {e}")
-            return False
-    elif isinstance(params, StdioServerParams):
-        try:
-            script_path = params.args[0]
-            if not os.path.exists(script_path):
-                logger.error(f"Script not found: {script_path}")
-                return False
-            return True
-        except Exception as e:
-            logger.warning(f"Server health check failed for {params.args}: {e}")
-            return False
-    return False
+            Key characteristics of Phase 1:
+                Focus on safety and side effects
+                Determines optimal dosing
+                Usually involves healthy volunteers
+                Takes several months to complete
+        - Phase 2: Testing Effectiveness
+            After establishing basic safety parameters, researchers move to evaluate the treatment's effectiveness. Phase 2 trials represent a crucial step where scientists begin to understand how well a treatment works for its intended purpose. This phase involves carefully selected participants who have the specific condition the treatment aims to address.
 
+            Key aspects include:
+                100-300 participants
+                Tests effectiveness against specific conditions
+                Continues monitoring for side effects
+                Usually lasts several months to two years
+        - Phase 3: Comparative Testing
+            Phase 3 trials mark the most comprehensive evaluation stage, where researchers compare new treatments against current standard therapies. This phase involves the largest number of participants and provides the most detailed evidence of a treatment's value. The FDA explains:
+
+                "Study Participants: 300 to 3,000 volunteers who have the disease or condition. Length of Study: 1 to 4 years. Purpose: Efficacy and monitoring of adverse reactions"
+
+            This phase involves:
+                Large-scale testing (300-3,000 participants)
+                Comparison with standard treatments
+                Multiple testing locations
+                Randomized control groups
+                Duration of 1-4 years
+    """
+)
+
+PATIENT_MATCHING_SYS = (
+    '''
+    You are a Patient Matching Expert. You have one tool:
+        - match_patient_trial(xml_path: str, trial_text: str): this tool matches patients with
+        trials and it needs a patient summary xml file and the trial summary text. Never run this tool
+        without path provided for xml patients summary.
+    Do not invent patients or trial text. Use the exact structured trial text provided from the trial_generation_agent.
+    Return the number of matched patients and a list of matched patient IDs.
+    '''
+)
+TRIAL_PRED_SYS = (
+    '''
+    You are a Trial Prediction Agent. You predict trial success according to the trial text it is provided. 
+    You return only the probability score (e.g., 0.75). Do not generate trial or drugs, do not predict properties or docking scores. Never generate free text, only return
+    the tool result it returns.
+    '''
+)
+
+SELECTOR_PROMPT = (
+    '''
+    Select an agent to perform task.
+
+    {roles}
+
+    Current conversation context:
+    {history}
+
+    Read the above conversation, then select an agent from {participants} to perform the next task. 
+    Follow strictly the plan from planning_agent, including the phased workflow (Drug Discovery → Preclinical → Clinical) and optimization loops.
+    Make sure the planning_agent has assigned tasks before other agents start working. 
+    Select only the agents as is in plan generated by planning_agent.
+    Never select trial_generation_agent before final optimized lead with good ADMET, chemical properties, docking, and one selected lead compound.
+    Never select molecule_optimization_agent if ADMET properties are not predicted with values.
+    Never skip docking or property re-evaluation after optimization.
+    If an agent fails to produce output after one retry, log the failure and select the planning_agent to handle the error and proceed.
+    Once the planning_agent outputs the final report reeturn "FINAL" and select no further agents and terminate the process.
+    Only select one agent. DO NOT select agents that are NOT in plan generated by planning_agent. 
+    When you call the agent once and it generated output, DO NOT call it multiple times. Read the conversation history and use that response. 
+    '''
+)
 
 async def main():
-    logger.info("Starting Drug Discovery Workflow Main Execution.")
-
-    uniprot_id = input("Please enter the UniProt ID (e.g., P35354): ").strip().upper()
-    if not uniprot_id:
-        logger.critical("UniProt ID cannot be empty. Exiting.")
-        return
-    num_molecules_input = input(
-        f"Please enter the number of molecules to generate (default: {DEFAULT_NUM_MOLECULES}): ").strip()
-    num_molecules = DEFAULT_NUM_MOLECULES
-    if num_molecules_input:
-        try:
-            num_molecules = int(num_molecules_input)
-            if num_molecules <= 0:
-                logger.warning(f"Number of molecules must be positive. Using default: {DEFAULT_NUM_MOLECULES}")
-                num_molecules = DEFAULT_NUM_MOLECULES
-        except ValueError:
-            logger.warning(f"Invalid number of molecules provided. Using default: {DEFAULT_NUM_MOLECULES}")
-
-    logger.info(f"Received input: UniProt ID = {uniprot_id}, Number of molecules = {num_molecules}")
-
-    model_client = OllamaChatCompletionClient(model="llama3.1:latest", timeout=600, json_output=True)
-    logger.info("OllamaChatCompletionClient initialized.")
-
-    druggen_params = StdioServerParams(command="python", args=["druggen_mcp_server.py"], read_timeout_seconds=1000)
-    docking_params = StdioServerParams(command="python", args=["docking_mcp_server.py"], read_timeout_seconds=2000)
-    cloud_parms = StreamableHttpServerParams(
-        url="https://your-ngrok-url.ngrok-free.app/mcp",
-        timeout=1000,
-        headers={"ngrok-skip-browser-warning": "true"},
-        sse_read_timeout=500.00
+    model_client = OpenAIChatCompletionClient(
+        model="o4-mini",
+        api_key="OPENAI-API-KEY", #add your openai api key here
+        max_output_tokens=1500
     )
-    logger.info("MCP Server parameters defined.")
 
-    server_checks = await asyncio.gather(
-        check_server_health(druggen_params),
-        check_server_health(docking_params),
-        check_server_health(cloud_parms),
-        return_exceptions=True
-    )
-    for i, (params, result) in enumerate(zip([druggen_params, docking_params, cloud_parms], server_checks)):
-
-        if not isinstance(result, bool) or not result:
-            server_info = params.url if isinstance(params, StreamableHttpServerParams) else ' '.join(params.args)
-            logger.warning(f"Server {i + 1} may be unavailable: {server_info}. Result: {result}")
-        else:
-            server_info = params.url if isinstance(params, StreamableHttpServerParams) else ' '.join(params.args)
-            logger.info(f"Server {i + 1} ({server_info}) is healthy.")
-
-    druggen_tools = []
-    docking_tools = []
-    txgemma_tools = []
-    meditab_tools = []
-    panacea_tools = []
     try:
-        logger.info("Attempting to load tools from MCP servers...")
-        druggen_tools = await mcp_server_tools(druggen_params)
-        docking_tools = await mcp_server_tools(docking_params)
-        cloud_tools = await mcp_server_tools(cloud_parms)
-        txgemma_tools = [t for t in cloud_tools if t.name in ["predict_properties", "toxicity_screening"]]
-        meditab_tools = [t for t in cloud_tools if t.name in ["predict_trial_success"]]
-        panacea_tools = [t for t in cloud_tools if t.name in ["match_patient_trial"]]
+        druggen_tools = await mcp_server_tools(StdioServerParams(
+            command="python", args=["druggen_mcp_server.py"], read_timeout_seconds=600))
+        docking_tools = await mcp_server_tools(StdioServerParams(
+            command="python", args=["docking_mcp_server.py"], read_timeout_seconds=1800))
+        chemical_properties_tools = await mcp_server_tools(StdioServerParams(
+            command="python", args=["chemical_properties_mcp_server.py"], read_timeout_seconds=1500))
+        admet_properties_tools = await mcp_server_tools(StdioServerParams(
+            command="python", args=["admet_prediction_mcp_server.py"], read_timeout_seconds=1500))
+        name_tools = await mcp_server_tools(
+            StdioServerParams(command="python", args=["name2smiles_mcp_server.py"], read_timeout_seconds=150))
+        optimization_tools = await mcp_server_tools(
+            StdioServerParams(command="python", args=["mol_opt_mcp_server.py"], read_timeout_seconds=1500))
+        panacea_patient_tools = await mcp_server_tools(
+            StdioServerParams(command="python", args=["patient_matching_mcp_server.py"], read_timeout_seconds=3000))
+        panacea_trial_tools = await mcp_server_tools(
+            StdioServerParams(command="python", args=["trialgen_mcp_server.py"], read_timeout_seconds=3000))
+        meditab_tools = await mcp_server_tools(
+            StdioServerParams(command="python", args=["trialpred_mcp_server.py"], read_timeout_seconds=3000))
+    planning_agent = AssistantAgent(
+        name="planning_agent",
+        description="An agent for planning tasks, this agent should be the first to engage when given a new task.",
+        model_client=model_client,
+        system_message="""
+        You are a planning agent. 
+        Your job is to break down complex tasks into smaller, manageable subtasks.
+        Your team members are:
+            1. druggen_agent: Only generates drug SMILES for given UniProt ID or IDs from target, so use it if drugs are not given in task.
+            2. chemical_agent — Chemical Properties Specialist
+                 Scope: predict/report chemical properties and return lead compounds (no trial/drug generation).
+                 Tools it can use:
+                   - select_leads_from_smiles(smiles_list)
+                   - predict_pka_batch(smiles_list)
+                   - logd_acid_batch(smiles_list, pH=7.4)
+                   - logd_base_batch(smiles_list, pH=7.4)
+                   - rdkit_physchem_batch(smiles_list, pH=7.4)
+                   - predict_all_batch(smiles_list, is_acid=None|bool, is_base=None|bool, pH=7.4)
+            3. admet_properties_agent — ADMET Properties Specialist
+                 Scope: predict/report ADMET properties and docking; may resolve names/SMILES (no trial/drug generation).
+                 For choosing the main lead compound, only one (THE BEST).
+                 Tools it can use:
+                   - get_drug_name_from_smiles(smiles_list)
+                   - get_smiles_from_drug_name(drug_name)
+                   - chemfm_list_properties()
+                   - chemfm_get_description(property_name)
+                   - chemfm_predict_single(smiles, property_name)    
+                   - chemfm_predict_many(smiles, properties_list)        
+                   - run_docking(target, smiles_list)
+                 Always plan chemfm_list_properties tool first so you can take the exact names of the properties to run other 
+                 admet tools.
+            4. molecule_optimization_agent: Optimize lead molecule by a property it needs to be increased/decreased. It needs to be called
+               with admet or chemical property, never docking.         
+            5. trial_generation_agent: Generates trial for given lead compound with ADMET and chemical properties and/or disease/target so use it when trial generation is required.
+               It always needs to be the last agent (after admet agent and chem agent) to be called, except if it is not the only agent that is required. Always return structured
+               format from this agent like this
+               - drug: SMILES and NAME  
 
-        logger.info(f"Loaded {len(druggen_tools)} tools from Druggen server.")
-        logger.info(f"Loaded {len(docking_tools)} tools from Docking server.")
-        logger.info(f"Loaded {len(txgemma_tools)} tools from TxGemma server.")
-        logger.info(f"Loaded {len(meditab_tools)} tools from Meditab server.")
-        logger.info(f"Loaded {len(panacea_tools)} tools from Panacea server.")
+CLINICAL TRIAL: 
+- acronym: string, short study name  
+- brief_title: string  
+- official_title: string, descriptive trial title  
+- study_status: string (e.g., "Recruiting", "Completed")  
+- study_start_date: string, ISO format (e.g., "2026-03")  
+- primary_completion_date: string, ISO format  
+- completion_date: string, ISO format    
+- condition: string, clinical condition studied  
+- study_type: string 
+- phase: string  
+- intervention_model: string  
+- allocation: string   
+- masking: string   
+- enrollment: integer
+- arms: use output from panacea_extract_components tool, give it drug SMILES, brief_title, official_title, phase, and condition as input
+- intervention_description: string, must reference the molecule by its SMILES  
+- primary_outcomes: use output from panacea_extract_components tool, give it drug SMILES, brief_title, official_title, phase, and condition as input  
+- secondary_outcomes: use output from panacea_extract_components tool, give it drug SMILES, brief_title, official_title, phase, and condition as input  
+- other_outcomes: use output from panacea_extract_components tool, give it drug SMILES, brief_title, official_title, phase, and condition as input 
+- eligibility_criteria: use output from panacea_extract_components tool, give it drug SMILES, brief_title, official_title, phase, and condition as input
+- study_documents: list of strings 
+- brief_summary: string, concise description of trial purpose, design, intervention, and eligibility.
+            6. patient_matching_agent: Matches patients with trials. Do not plan agent without path provided for xml patients summary.
+               And do not give it an invented trial summary text, use strictly the trial summary text generated from trial_generation_agent.
+            7. trial_prediction_agent: Predicts trial success from structured output from trial generation agent.
+        Rules:
+            Strictly follow this workflow for drug development tasks:
+            - Drug Discovery Phase:
+              - Hits Generation: druggen_agent to generate >10 SMILES.
+              - Docking: admet_properties_agent with run_docking to score and filter hits (keep top with lowest scores).
+              - Leads Identification: chemical_agent for physchem and select_leads_from_smiles (apply Lipinski/Veber filters); admet_properties_agent for 10 relevant ADMET properties.
+              - Select single best lead (lowest docking + passes filters + best ADMET, e.g., bioavailability >0.5, low hERG/hepatotoxicity).
+            - Lead Optimization Phase:
+              - molecule_optimization_agent on best lead, targeting weak properties (e.g., increase bioavailability if <0.5, decrease toxicity risks).
+              - Re-evaluate: admet_properties_agent (docking + ADMET), chemical_agent (physchem/Lipinski/Veber).
+              - Loop: If not satisfactory (fails Lipinski/Veber, bioavailability <0.5, high toxicity risks, docking score worse than initial lead), plan another optimization targeting issues. Cap at 3 iterations; if still unsatisfactory, select best available and proceed.
+            - Preclinical Phase: Final ADMET re-assessment on optimized lead with admet_properties_agent.
+            - Clinical Phase: trial_generation_agent on final lead; if XML path, patient_matching_agent; then trial_prediction_agent.
+            - When drug generation is asked, generate just candidate drugs, NEVER generate trial, and check with get_drug_name_from_smiles if names for generated SMILES are available.
+            - run_docking must be run after hits and after each optimization.
+            - Final Report format should be like this:
+                Drug Discovery Properties:
+                - Hits: [list of initial SMILES]
+                - Leads: [list of selected leads with properties]
+                - Optimized Lead: SMILES with optimized properties
+                - Chemical Properties: [dict or list from chem agent]
+                - ADMET Properties: [dict or list from admet agent]
+                - Docking Scores: [scores]
 
-        if not druggen_tools or not docking_tools or not txgemma_tools or not meditab_tools or not panacea_tools:
-            raise ValueError("One or more MCP servers returned no tools (or empty list). Ensure all tools are exposed.")
+                Clinical Trial Report:
+                [full structured trial from trial agent]
 
+                Patient Matching: [results if applicable]
+
+                Trial Success Probability: [probability]
+
+                Summary: [overall summary]
+            - Never invent your response from the agent. If a response from the agent is not present in the history, plan the agent to be called.
+            - Always check the ADMET and chemical properties of the optimized new molecule, and if they are not good run optimization up to 3 times.
+            - For ADMET prediction use 10 most relevant properties form the ADMET properties list (e.g., bioavailability, solubility, clearance, BBB permeability, hERG inhibition, hepatotoxicity).
+            - If any agent or tool fails to produce output, log the failure and proceed with the best available data, selecting the best lead or optimized molecule to continue.
+            - After all tasks are complete or if no further progress is possible, output the final report in the specified format.
+        Do not invent new chemical or ADMET tests, use only the properties that are available and according to them choose the next steps
+        and make the report. If additional tests are needed, just suggest them, but mention you do not have the tools to do them and continue
+        with what you have. NEVER invent docking scores.
+        For planning the trial generation, you must have a lead compound, or a compound must be specified in the task. 
+        Do not invent or choose SMILES by yourself, and never prioritize SMILES with name available. Never plan get_drug_name_from_smiles for filtering SMILES lists
+        in any way, only if that is explicitly asked. 
+        You only plan and delegate tasks - you do not execute them yourself. You do not need to incorporate all agents in your plan.
+        Always reason how and why you choose the drug before planning the trial generation agent.
+        When assigning tasks, use this format:
+        1. <agent> : <task>
+
+        After all tasks are complete, the required tools are executed, or if any step fails and no further progress is possible, output the final report.
+        """
+    )
+
+    druggen_agent = AssistantAgent(
+        name="druggen_agent",
+        model_client=model_client,
+        tools=list(druggen_tools),
+        system_message=DRUGGEN_SYS
+    )
+    chemical_agent = AssistantAgent(
+        name="chemical_agent",
+        model_client=model_client,
+        tools=list(chemical_properties_tools),
+        system_message=CHEM_PROPERTIES_SYS
+    )
+    admet_properties_agent = AssistantAgent(
+        name="admet_properties_agent",
+        model_client=model_client,
+        tools=list(admet_properties_tools) + list(docking_tools) + list(name_tools),
+        system_message=ADMET_PROPERTIES_SYS
+    )
+    molecule_optimization_agent = AssistantAgent(
+        name="molecule_optimization_agent",
+        model_client=model_client,
+        tools=list(optimization_tools),
+        system_message=MOL_OPT_SYS
+    )
+    trial_generator_agent = AssistantAgent(
+        name="trial_generator_agent",
+        model_client=model_client,
+        tools=list(panacea_trial_tools),
+        system_message=TRIAL_SYS
+    )
+    patient_matching_agent = AssistantAgent(
+        name="patient_matching_agent",
+        model_client=model_client,
+        tools=list(panacea_patient_tools),
+        system_message=PATIENT_MATCHING_SYS
+    )
+    trial_prediction_agent = AssistantAgent(
+        name="trial_prediction_agent",
+        model_client=model_client,
+        tools=list(meditab_tools),
+        system_message=TRIAL_PRED_SYS
+    )
+
+    termination = TextMentionTermination("FINAL")
+
+    task = input("Enter your task: ").strip() or \
+           "Simulate drug development for DPP4(P27487)"
+
+    participants = [
+        planning_agent, druggen_agent, chemical_agent, admet_properties_agent,
+        molecule_optimization_agent, trial_generator_agent,
+        patient_matching_agent, trial_prediction_agent
+    ]
+    team = SelectorGroupChat(
+        participants=participants,
+        model_client=model_client,
+        selector_prompt=SELECTOR_PROMPT,
+        termination_condition=termination,
+        max_turns=30
+    )
+
+    try:
+        result = await Console(team.run_stream(task=task))
+        text = result.messages[-1].content
+        return text
     except Exception as e:
-        logger.critical(
-            f"Failed to load tools from MCP servers: {e}. Please ensure servers are running and exposing tools correctly.")
-        return
-
-    selector_tool = FunctionTool(
-        select_best_smiles,
-        name="select_best_smiles",
-        description="Selects the SMILES string with the lowest docking score from a list of SMILES and their corresponding scores. It identifies and returns the single best SMILES string along with its optimal score.",
-    )
-    logger.info("Custom selector tool defined.")
-
-
-    logger.info("Initializing Autogen agents...")
-    workflow_initiator = UserProxyAgent(
-        name="workflow_initiator",
-        description="Controls the drug discovery workflow by sending messages to other agents."
-    )
-
-    agents = {
-        "druggen_agent": AssistantAgent(
-            name="druggen_agent",
-            model_client=model_client,
-            tools=druggen_tools,
-            system_message=(
-                "You are the molecule generation agent. Your sole task is to generate SMILES strings.\n"
-                "Your input will be a user message specifying the number of molecules and UniProt ID.\n"
-                f"You MUST call ONLY the 'run_druggen' tool with arguments: {{'uniprot_id': '{uniprot_id}', 'num_generated': {num_molecules}}}.\n"
-                "After calling 'run_druggen', you MUST respond with the tool's output formatted as valid JSON: {'smiles': ['SMILES1', ...]}.\n"
-                "DO NOT include any conversational text, explanations, or extraneous JSON. Provide ONLY the final JSON result.\n"
-                "If 'run_druggen' fails or no SMILES are generated by it, return: {'error': 'Failed to generate SMILES', 'retry': true}."
-            )
-        ),
-        "toxscreen_agent": AssistantAgent(
-            name="toxscreen_agent",
-            model_client=model_client,
-            tools=[*txgemma_tools],
-            system_message=(
-                "You are the toxicity screening agent. Your SOLE purpose is to screen molecules for toxicity.\n"
-                "Your input will always be a JSON string containing a list of SMILES, like: `{'smiles': ['SMILES1', 'SMILES2']}`.\n"
-                "You MUST IMMEDIATELY and WITHOUT FAIL call the 'toxicity_screening' tool.\n"
-                "The 'toxicity_screening' tool requires a 'smiles_list' argument, which MUST be the list of SMILES from your input.\n"
-                "Example of the tool call you MUST generate: `toxicity_screening(smiles_list=['SMILES1', 'SMILES2'])`.\n"
-                "Once the 'toxicity_screening' tool executes, you will receive its output. This output will be a dictionary, e.g., `{'non_toxic_smiles': ['SMILES_A', 'SMILES_B']}` or `{'error': ...}`.\n"
-                "Your FINAL response MUST be ONLY this exact tool output, formatted as valid JSON. If the tool output is `{'non_toxic_smiles': [...]}` then return `{'non_toxic_smiles': [...]}`. If it's `{'error': ...}` then return that. Do NOT add any extra text or wrapping.\n"
-                "DO NOT include any conversational text, explanations, or any other JSON structure. Respond ONLY with the final, required JSON."
-            )
-        ),
-        "docking_agent": AssistantAgent(
-            name="docking_agent",
-            model_client=model_client,
-            tools=docking_tools,
-            system_message=(
-                "You are the molecule docking agent. Your role is to perform molecular docking simulations.\n"
-                "Your input will be a JSON string with the key 'non_toxic_smiles' containing a list of SMILES strings.\n\n"
-                "Your task is to:\n"
-                "1. Parse the input JSON to extract the list of non-toxic SMILES.\n"
-                "2. Call the 'run_docking' tool. The arguments for this tool MUST be:\n"
-                f"   - 'smiles': the list of SMILES extracted from your input.\n"
-                f"   - 'uniprot_id': '{uniprot_id}' (This is the target protein ID for docking).\n"  
-                "3. After successfully calling 'run_docking', you MUST respond with the tool's output formatted as valid JSON.\n"
-                "   The expected output JSON format is: {'smiles': ['SMILES1', ...], 'scores': [score1, ...]}.\n"
-                "DO NOT include any conversational text, explanations, or extraneous JSON. Provide ONLY the final JSON result.\n"
-                "If 'run_docking' fails or returns empty results, return: {'error': 'Failed to perform docking or no results', 'retry': true}."
-            )
-        ),
-        "selector_agent": AssistantAgent(
-            name="selector_agent",
-            model_client=model_client,
-            tools=[selector_tool],
-            system_message=(
-                "You are the selection agent.\n"
-                "Your input will be a JSON string like: {'smiles': [...], 'scores': [...]}.\n"
-                "1. Validate input: it must contain 'smiles' and 'scores' keys with equal-length lists.\n"
-                "2. Call 'select_best_smiles' with the provided {'smiles': ..., 'scores': ...}.\n"
-                "3. Once the 'select_best_smiles' tool executes, you will receive its output. This output will be a dictionary, e.g., `{'ranked_smiles': ['SMILES_string'], 'ranked_scores': [score_value]}` or `{'error': ...}`.\n"
-                "4. Your FINAL response MUST be ONLY this exact tool output, formatted as valid JSON. If the tool output is `{'ranked_smiles': [...]}` then return that. If it's `{'error': ...}` then return that. Do NOT add any extra text or wrapping.\n"
-                "5. If input is invalid or selection fails, return: {'error': 'Invalid input for selection or selection failed', 'retry': true}."
-            )
-        ),
-        "profiling_agent": AssistantAgent(
-            name="profiling_agent",
-            model_client=model_client,
-            tools=txgemma_tools,
-            system_message=(
-                "You are the molecule profiling agent. Your sole task is to predict properties for a single SMILES string.\n"
-                "Your input will be a JSON string like: `{'smiles': 'SMILES_string'}`.\n"
-                "You MUST call the 'predict_properties' tool with the 'smiles' argument.\n"
-                "After calling the tool, you will receive a detailed text output for each property. "
-                "You MUST parse this output carefully and extract the 'Answer:' for each property.\n"
-                "Specifically:\n"
-                "- For 'BBB Permeability': if Answer is '(A)', set value to 'Does not cross BBB'; if '(B)', set value to 'Crosses BBB'.\n"
-                "- For 'Toxicity': if Answer is '(A)', set value to 'Not toxic'; if '(B)', set value to 'Toxic'.\n"
-                "- For 'Lipophilicity', 'Solubility', 'PPBR', 'Half-Life': Extract the numerical value directly after 'Answer:' and convert it to an integer.\n"
-                "Your FINAL response MUST be ONLY the extracted properties, formatted as valid JSON, with precise string matches for categorical values and correct integer values for numerical ones.\n"
-                "Example expected output: {'BBB_Permeability': 'Does not cross BBB', 'Toxicity': 'Not toxic', 'Lipophilicity': 533, 'Solubility': 801, 'PPBR': 342, 'Half-Life': 1}.\n"
-                "Do NOT add any extra text, explanations, or wrapping beyond this JSON structure."
-            )
-        ),
-        "summary_agent": AssistantAgent(
-            name="summary_agent",
-            model_client=model_client,
-            system_message=(
-                "You are the summarization agent.\n"
-                "Your input will be a JSON string like: {'smiles': '...', 'score': ..., 'properties': {...}}.\n"  
-                "Generate a concise summary report for the selected molecule, including its SMILES, docking score, and predicted properties.\n"  
-                "Return ONLY valid JSON in the format: {'report': {'smiles': '...', 'score': ..., 'properties': {...}}, 'completed': true}.\n"  
-                "If the input is invalid or missing critical information, return: {'error': 'Invalid input for summary', 'completed': false}."
-            )
-        ),
-       "trial_generator_agent": AssistantAgent(
-            name="trial_generator_agent",
-            model_client=model_client,
-            system_message="""
-                You are a clinical trial design expert specializing in metabolic diseases.
-                Your task is to generate a realistic Phase I clinical trial protocol for a novel drug targeting DDP4 target connected to diabetes mellitus type 2.
-                Input will be a JSON string with the format:
-                {'drug_smiles': 'SMILES_STRING', 'target_uniprot_id': 'UNIPROT_ID', 'basic_eligibility': 'ELIGIBILITY_TEXT'}
-                
-                You MUST respond with a valid JSON object containing a top-level key: "trial_protocol_text", whose value is an object with the following fields:
-
-                - brief_title – ≤300 characters.
-                - official_title – More descriptive trial title.
-                - condition – Clinical condition studied.
-                - study_type – Type of study (e.g., "Interventional").
-                - phase – Clinical trial phase (e.g., "Phase 1").
-                - intervention_model – Model used (e.g., "Parallel Assignment").
-                - allocation – Randomization method (e.g., "Randomized").
-                - masking – Blinding strategy (e.g., "Double-Blind").
-                - intervention_description – Description of the intervention (must reference the molecule).
-                - enrollment – Integer (between 20 and 100).
-                - arms – List of treatment arms, each with:
-                  - name
-                  - description
-                  - dose
-                - study_start_date – ISO format (e.g., "2026-03").
-                - primary_outcomes – List of primary outcome measures.
-                - secondary_outcomes – List of secondary outcome measures.
-                - eligibility_criteria – Object with two keys:
-                  - inclusion – List of inclusion criteria.
-                  - exclusion – List of exclusion criteria.
-                - summary – Summary of a trial that describes trial purpose, design, intervention, outcomes, and MUST include eligibility criteria with inclusion criteria and exclusion criteria 
-                
-                Example structure:
-                
-                {
-                  "trial_protocol_text": {
-                    "brief_title": "...",
-                    "official_title": "...",
-                    "condition": "...",
-                    "study_type": "...",
-                    "phase": "...",
-                    "intervention_model": "...",
-                    "allocation": "...",
-                    "masking": "...",
-                    "intervention_description": "...",
-                    "enrollment": ...,
-                    "arms": [
-                      { "name": "...", "description": "...", "dose": "..." },
-                      { "name": "...", "description": "...", "dose": "..." }
-                    ],
-                    "study_start_date": "...",
-                    "primary_outcomes": ["...", "..."],
-                    "secondary_outcomes": ["...", "..."],
-                    "eligibility_criteria": {
-                      "inclusion": ["...", "..."],
-                      "exclusion": ["...", "..."]
-                    },
-                    "summary": "..."
-                  }
-                }
-                                    
-                If input is invalid, return:
-                {'error': 'Invalid input for trial protocol generation', 'retry': true}
-                
-                Return ONLY the JSON object, with no additional text.
-            """
-        ),
-        "patient_matching_agent": AssistantAgent(
-            name="patient_matching_agent",
-            model_client=model_client,
-            tools=panacea_tools,
-            system_message=(
-                "You are the patient-trial matching agent.\n"
-                "Your input is a JSON string: {'xml_path': 'STRING', 'trial_summary': 'STRING', 'outfile': 'STRING (optional)'}.\n"
-                "You MUST call the 'match_patient_trial' tool with 'xml_path' and 'trial_summary' as arguments.\n"
-                "Return ONLY the tool's JSON output without any additional text.\n"
-                "If the tool fails or returns no output, return: {'error': 'Cannot match patients', 'retry': true}\n"
-            )
-        ),
-        "trial_outcome_prediction_agent": AssistantAgent(
-            name="trial_outcome_prediction_agent",
-            model_client=model_client,
-            tools=meditab_tools,
-            system_message=(
-                "You are the trial outcome prediction agent.\n"
-                "You ONLY use the 'predict_trial_success' tool.\n"
-                "Input format: {'trial_text': 'STRING'}\n"
-                "Call 'predict_trial_success' with this argument and return its JSON output directly.\n"
-                "If the tool fails, return: {'error': 'Cannot predict trial outcome', 'retry': true}\n"
-                "Do NOT include any other text."
-            )
-        ),
-        "clinical_report_generator_agent": AssistantAgent(
-            name="clinical_report_generator_agent",
-            model_client=model_client,
-            system_message=(
-                "You are the Clinical Study Report (CSR) generator.\n"
-                "Your task is to compile a standardized report summarizing the drug discovery process and clinical trial feasibility.\n"
-                "You MUST reply ONLY in valid JSON with no explanations, no markdown, and no commentary.\n\n"
-                "**Input format:**\n"
-                "{\n"
-                "  \"drug_discovery_summary\": {...},\n"
-                "  \"trial_protocol\": {...},\n"
-                "  \"tabular_trial_data\": [...],\n"
-                "  \"patients_meditab\": [...],\n"
-                "  \"patient_trial_pairs\": [...],\n"
-                "  \"matched_patients_summary\": {\n"
-                "       \"total_patients_parsed\": INT,\n"
-                "       \"matched_patients_count\": INT,\n"
-                "       \"top_matches\": [...]\n"
-                "  },\n"
-                "  \"trial_outcome_prediction\": {\n"
-                "      \"predicted_success_probability\": FLOAT,\n"
-                "      \"prediction_notes\": \"STRING\"\n"
-                "  },\n"
-                "  \"uniprot_id\": \"STRING\"\n"
-                "}\n\n"
-                "**Your JSON output MUST strictly follow this schema:**\n"
-                "{\n"
-                "  \"completed\": true,\n"
-                "  \"report\": {\n"
-                "     \"report_title\": \"Integrated Drug Discovery and Clinical Trial Feasibility Report for [Drug SMILES / Target ID]\",\n"
-                "     \"date_generated\": \"2025-07-07\",\n"
-                "     \"summary_synopsis\": \"STRING\",\n"
-                "     \"drug_candidate_profile\": {\n"
-                "         \"smiles\": \"STRING\",\n"
-                "         \"docking_score\": FLOAT,\n"
-                "         \"predicted_properties\": {...}\n"
-                "     },\n"
-                "     \"clinical_trial_protocol_summary\": {\n"
-                "         \"title\": \"STRING\",\n"
-                "         \"objectives\": \"STRING\",\n"
-                "         \"design_overview\": \"STRING\",\n"
-                "         \"key_eligibility_criteria\": {\n"
-                "             \"inclusion\": [...],\n"
-                "             \"exclusion\": [...]\n"
-                "         },\n"
-                "         \"treatment_plan_overview\": \"STRING\"\n"
-                "     },\n"
-                "     \"patient_matching_results\": {\n"
-                "         \"total_patients_parsed\": INT,\n"
-                "         \"matched_patients_count\": INT,\n"
-                "         \"top_matches\": [\n"
-                "            {\"pid\": \"STRING\", \"match_probability\": FLOAT}, ...\n"
-                "         ]\n"
-                "     },\n"
-                "     \"trial_outcome_prediction\": {\n"
-                "         \"predicted_success_probability\": FLOAT,\n"
-                "         \"prediction_notes\": \"STRING\"\n"
-                "     },\n"
-                "     \"conclusion_and_recommendations\": \"STRING\"\n"
-                "  }\n"
-                "}\n\n"
-                "**Rules:**\n"
-                "1. Wrap your response in a JSON object with a top-level key `completed` set to true, and a `report` key as shown above.\n"
-                "2. Always populate the JSON fields using the input data, do not fabricate.\n"
-                "3. If the input is invalid, reply with:\n"
-                "{ \"error\": \"Invalid input for report generation\", \"completed\": false }\n"
-                "4. Do not wrap the JSON in markdown.\n"
-                "5. Do not provide any additional commentary or explanation outside the JSON.\n"
-
-            )
-
-        )
-    }
-    logger.info("Autogen agents initialized.")
-
-    orchestrator = DrugDiscoveryOrchestrator(
-        agents=agents,
-        uniprot_id=uniprot_id,
-        num_molecules=num_molecules,
-        orchestrator_agent=workflow_initiator,
-        patient_data_filepath=PATIENT_DATA_FILEPATH
-    )
-
-    logger.info("Running drug discovery workflow...")
-    final_result = await orchestrator.run_workflow()
-
-    if final_result.get("completed"):
-        logger.info("\n--- Workflow Completed Successfully! ---")
-        if final_result.get("report"):
-            logger.info("Final Report:")
-            print(json.dumps(final_result["report"], indent=2))
-        else:
-            logger.info("Workflow completed, but no report was generated.")
-    else:
-        logger.error(f"\n--- Workflow Failed! Error: {final_result.get('error', 'Unknown error')} ---")
-
+        return f"Error running team: {str(e)}"
 
 if __name__ == "__main__":
     asyncio.run(main())
