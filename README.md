@@ -1,6 +1,6 @@
 # Prompt-to-Pill: Mapping the Emerging Role of LLMs in End-to-End Drug Discovery
 
-This project implements a modular **multi-agent system** to simulate a full pipeline of drug discovery, from target input to clinical trial feasibility. Agents are orchestrated to perform tasks including molecular generation, docking, toxicity filtering, trial generation, patient simulation, patient-trial matching, and report generation.
+This study presents the Prompt-to-Pill Multi-Agent Pipeline, a comprehensive, modular framework that integrates AI-driven agents across the entire drug development lifecycle—from molecular design to clinical trial simulation. The system is structured into three coordinated phases: Drug Discovery, Preclinical, and Clinical, each governed by a central Orchestrator and a Planning Agent. Within this workflow, specialized agents autonomously handle tasks such as molecular generation, docking, physicochemical and ADMET profiling, lead optimization, trial protocol construction, patient simulation and matching, and outcome prediction. Together, they enable ask-driven simulation of drug development and trial feasibility for a given therapeutic target (see DOI: [https://doi.org/10.1101/2025.08.12.669861]).
 
 ---
 
@@ -8,12 +8,18 @@ This project implements a modular **multi-agent system** to simulate a full pipe
 
 | File                    | Description                                                           |
 |-------------------------|-----------------------------------------------------------------------|
-| `Orchestrator.py`       | Coordinates communication between all agents and tools in the system. |
-| `Prompt-to-pill.py`     | Entry point script to run the full workflow.                          |
+| `Prompt-to-pill.py`     | Entry point script to orchestrate the full Prompt-to-Pill multi-agent workflow.                          |
 | `druggen_mcp_server.py` | MCP server for the Drug Generator agent.                              |
-| `docking_module.py`     | Docking implementation using AutoDock Vina. Coordinates must be manually adjusted per target.                           |
+| `docking_module.py`     | Docking implementation using AutoDock Vina with P2Rank-based pocket detection.                           |
 | `docking_mcp_server.py` | MCP server that runs docking as a callable tool.                      |
-| `http_mcp_server.py`    | MCP server for agents requiring GPU.                                  |
+| `admet_prediction_mcp_server.py`    | MCP server for the ADMET Prediction Agent powered by ChemFM-based models.                                 |
+| `chemical_properties_mcp_server.py` | MCP server for the Chemical Properties Agent, computing key RDKit descriptors. |
+|`mol_opt_mcp_server.py`| MCP server for the Molecule Optimization Agent, improving lead candidates iteratively.|
+|`evaluate_docking.py` | Utility script for analyzing docking results and RMSD benchmarking.|
+|`name2smiles_mcp_server.py` | MCP server converting compound names or InChI strings to canonical SMILES.|
+|`patient_matching_mcp_server.py` | MCP server for the Patient-Matching Agent using Panacea to align patients with trial criteria.|
+|`trialgen_mcp_server.py` | MCP server for the Trial Generation Agent that constructs clinical trial protocols.|
+|`trialpred_mcp_server.py` | MCP server for the Trial Prediction Agent predicting trial success with MediTab.|
 
 ---
 
@@ -23,18 +29,20 @@ This project implements a modular **multi-agent system** to simulate a full pipe
 
 ![Multi-Agent Drug Discovery System](./workflow.png)
 
-This diagram illustrates the **end-to-end drug discovery pipeline**, from target protein input to clinical feasibility report generation. Each red bubble represents an agentic function in the orchestrated system.
+This diagram illustrates the Prompt-to-Pill Multi-Agent Architecture, depicting the complete workflow from target input to clinical feasibility report generation. The system is task-dependent—each stage is dynamically configured by the Planning Agent, which selects and executes the appropriate agents and tools based on the specific requirements of the current task.
 
-**Key Stages:**
-1. **Input:** A UniProt ID of a protein target is provided.
-2. **Drug Generation Agent:** Generates candidate drug-like molecules as SMILES strings using DrugGen.
-3. **Docking Agent:** Runs molecular docking (e.g., via AutoDock Vina) to assess binding affinity with the target.
-4. **Toxicity Filter / Property Prediction Agent:** Toxic compounds are filtered; properties are predicted for the rest.
-5. **Trial Generation Agent:** Constructs a clinical trial protocol using LLMs (language models).
-6. **Patient Generation (Synthea):** Synthetic patients are simulated with EHRs and converted to text descriptions.
-7. **Patient-Matching Agent:** Matches patients to the generated trial using semantic similarity and classification.
-8. **Trial Outcome Prediction Agent:** Estimates success probability of the clinical trial for matched patients.
-9. **Final Report:** A summary report integrates molecule properties, trial design, patient matching, and outcome prediction.
+Key Stages:
+
+1.Target Input: The workflow begins with a UniProt ID identifying the target protein (e.g., DPP4, P27487).
+2.Drug Generation Agent: The Planning Agent invokes this tool to generate candidate molecules in SMILES format using the DrugGen framework.
+3.Docking Agent: The Planning Agent triggers the docking workflow, retrieving the receptor structure (from PDB or AlphaFold) and performing docking with AutoDock Vina using P2Rank-predicted binding pockets.
+4.Chemical & ADMET Properties Agents: Depending on task context, the Planning Agent activates these tools to compute physicochemical descriptors (MW, logP, TPSA, HBD, HBA, QED) and predict ADMET profiles via ChemFM-based models. Molecules that fail drug-likeness or toxicity filters are discarded.
+5.Molecule Optimization Agent: When optimization is required, the Planning Agent initiates iterative refinement of selected leads using DrugAssist-based methods to enhance bioavailability, solubility, and safety while maintaining binding affinity.
+6.Trial Generation Agent: Once preclinical properties are validated, the Planning Agent engages this module to construct structured clinical trial protocols based on the compound and disease profile, employing Panacea for eligibility criteria, arms, and outcomes generation.
+7.Patient Simulation (Synthea): Synthetic EHR data are generated to simulate patient populations representing realistic clinical diversity.
+8.Patient-Matching Agent: The Planning Agent activates this tool to match synthetic patients to the generated trial through Panacea-based eligibility reasoning and semantic similarity analysis.
+9.Trial Outcome Prediction Agent: The MediTab-based model is called to estimate the trial success probability for the matched cohort.
+10.Report Generation: Finally, the Orchestrator aggregates all results—molecular properties, docking affinities, ADMET predictions, trial design, patient matching, and success probabilities—into a unified feasibility report representing the complete Prompt-to-Pill pipeline.
 
 ---
 
@@ -51,27 +59,44 @@ From the repository:
 
 These descriptions serve as input to the matching model, which compares patient profiles against generated trial protocols to assess eligibility and similarity.
 
-## 📦 Required Repositories
-
-To run this pipeline, the following external repositories must be cloned into the same workspace:
+## 🛠️ Additional Tools
+To run this pipeline, the following repositories, models, and tools are required in the workspace:
+Repositories
+Clone the following repositories into your workspace:
 
 ```bash
 git clone https://github.com/mahsasheikh/DrugGen.git
 git clone https://github.com/RyanWangZf/MediTab.git
 ```
+Panacea-7B-Chat: Download from Hugging Face using the following Python code:
 
-The large language models for molecular property prediction and trial generation (e.g., TxGemma) are loaded directly in: http_mcp_server.py
+```python
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="linjc16/Panacea-7B-Chat",
+    local_dir="/kaggle/working/",
+    token="YOUR_HF_TOKEN",  # Replace with your Hugging Face token
+    local_dir_use_symlinks=False
+)
+```
+
+Install the following tools required for the pipeline with their specific versions:
+1. AutoDock Vina: Version 1.1.2
+2. MGLTools: Version 1.5.7
+3. Open Babel: Version 3.1.1 
+4. P2Rank: Version 2.5.1 
 
 ## 📋 Requirements
 
-Install Python dependencies:
+Python 3.11 is needed. Install Python dependencies:
 ```bash 
 pip install -r requirements.txt
+pip install -U llama-cpp-python
 ```
 
 ## ▶️ Running the Workflow
 
-Once all MCP servers are launched, Patients are in right format, docking coordinates are set and models are set up, run the full pipeline with:
+Once all MCP servers are launched, Patients are in right format, additional tools are installed, run the full pipeline with:
 ```Bash
 python Prompt-to-pill.py
 ```
