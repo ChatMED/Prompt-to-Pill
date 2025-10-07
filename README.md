@@ -83,7 +83,7 @@ pip install -U llama-cpp-python
 
 ## ▶️ Running the Workflow
 
-Once all MCP servers are launched, Patients are in right format, additional tools are installed, run the full pipeline with:
+Once all MCP servers are launched(for panacea-dependend servers, gpu is required), Patients are in right format, additional tools are installed, run the full pipeline with:
 ```Bash
 python Prompt-to-pill.py
 ```
