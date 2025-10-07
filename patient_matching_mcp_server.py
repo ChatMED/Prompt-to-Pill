@@ -16,7 +16,7 @@ _panacea = {"tok": None, "model": None}
 
 def get_panacea():
     if _panacea["tok"] is None or _panacea["model"] is None:
-        PANACEA_MODEL = os.getenv("PANACEA_MODEL", "/kaggle/working")
+        PANACEA_MODEL = os.getenv("PANACEA_MODEL", "path/to/panacea")
         _panacea["tok"] = AutoTokenizer.from_pretrained(PANACEA_MODEL, padding_side="left")
         if _panacea["tok"].pad_token is None:
             _panacea["tok"].add_special_tokens({"pad_token": "[PAD]"})
@@ -126,42 +126,57 @@ async def match_patient_trial(
     xml_path: str,
     trial_text: str,
     start: int = 0,
-    end: int = n, #add how many patients you want to check
+    end: int = 30,
     max_new_tokens: int = 512,
     outfile: str = "matched_patients.json",
 ) -> Dict[str, Any]:
     logger.info(f"[match_patient_trial] xml={xml_path}, start={start}, end={end}")
 
-    cache_key = hashlib.sha256(f"{xml_path}:{trial_text}:{start}:{end}".encode()).hexdigest()
-    if cache_key in _result_cache:
+    cache_key = hashlib.sha256(
+        f"{xml_path}:{trial_text}:{start}:{end}".encode()
+    ).hexdigest()
+    if cache_key in result_cache:
         logger.info("Returning cached result")
-        return _result_cache[cache_key]
+        return result_cache[cache_key]
 
     if not os.path.exists(xml_path):
         return {"error": f"XML not found: {xml_path}", "retry": True}
 
     try:
-        patients = parse_xml_patients(xml_path)
+        patients = parse_xml_patients(xml_path)  # you provide this
     except Exception as e:
         return {"error": f"Failed to parse XML: {e}", "retry": True}
 
-    df = pd.DataFrame([{"pid": p["topic_number"], "sentence": p["text_version"]} for p in patients[start:end]])
-    if df.empty:
+    patients_df = pd.DataFrame([
+        {"pid": p["topic_number"], "sentence": p["text_version"]}
+        for p in patients[start:end]
+    ])
+    if patients_df.empty:
         return {"error": "No patients in this chunk", "retry": True}
 
     matches: List[Dict[str, Any]] = []
     last_keep_alive = time.time()
     keep_alive_interval = 30
 
-    for _, row in df.iterrows():
+    for _, row in patients_df.iterrows():
         now = time.time()
         if now - last_keep_alive >= keep_alive_interval:
-            logger.info(f"Keep-alive: pid={row.pid}, progress {len(matches)}/{len(df)}")
+            logger.info(f"Keep-alive: processing pid={row.pid}, progress {len(matches)}/{len(patients_df)}")
             last_keep_alive = now
 
-        system_msg, user_msg = build_patient_matching_messages(row.sentence, trial_text)
+        system_msg, user_msg = build_patient_matching_messages(  # you provide this
+            patient_note=row.sentence,
+            trial_summary=trial_text
+        )
+
         try:
-            answer = panacea_chat_generate(system_msg, user_msg, max_new_tokens=max_new_tokens)
+            answer = panacea_chat_generate(
+                system_msg=system_msg,
+                user_msg=user_msg,
+                max_new_tokens=max_new_tokens,
+                temperature=0.7,
+                top_p=0.9
+            )
         except Exception as e:
             logger.error(f"Generation error for pid={row.pid}: {e}")
             continue
@@ -169,10 +184,11 @@ async def match_patient_trial(
         elig_line = None
         if "Trial-level eligibility" in answer:
             elig_line = answer.split("Trial-level eligibility:", 1)[-1].strip()
+
         if elig_line and elig_line.startswith("2"):
             matches.append({"pid": row.pid, "eligibility": elig_line})
 
-        logger.info(f"Progress: {len(matches)}/{len(df)} eligible so far")
+        logger.info(f"Progress: {len(matches)}/{len(patients_df)} eligible so far")
 
     abs_path = os.path.abspath(outfile)
     with open(abs_path, "w") as f:
@@ -180,10 +196,11 @@ async def match_patient_trial(
 
     result = {
         "matched_patients_file": abs_path,
-        "total_patients_parsed": int(len(df)),
+        "total_patients_parsed": int(len(patients_df)),
         "matched_patients_count": int(len(matches)),
         "matches": matches
     }
+    result_cache[cache_key] = result
     return result
 
 if __name__ == "__main__":
