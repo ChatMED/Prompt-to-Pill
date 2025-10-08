@@ -46,8 +46,8 @@ From the repository:
 
 These descriptions serve as input to the matching model, which compares patient profiles against generated trial protocols to assess eligibility and similarity. diabetes_patients_final.xml is example for the EHR format.
 
-## 🛠️ Enviorment setup
-Python 3.11 is needed. First clone this repository and install requierments:
+## 🛠️ Environment setup
+Python 3.11 is needed. First clone this repository and install requirements:
 
 ```bash
 git clone https://github.com/ChatMED/Prompt-to-Pill
@@ -83,5 +83,5 @@ Install the following tools required for the pipeline with their specific versio
 
 ## ▶️ Running the Workflow
 
-Once all MCP servers are launched (for Panacea-dependent servers, GPU is required), the patients are formatted correctly, and all additional tools are installed, insert your OPENAI_API_KEY in Prompt_to_pill.py and set the number of patients in patient_matching_mcp_server.py. Finally, run the full Prompt-to-Pill pipeline by executing Prompt_to_pill.py. After running the script, you will be prompted to enter your task and the system will then automatically execute the entire Prompt-to-Pill workflow, displaying each phase in sequence (drug generation, ADMET prediction, docking, optimization, clinical trial generation, and patient matching) directly in your terminal.
+Once all MCP servers are launched (for Panacea-dependent servers, GPU is required), the patient data are formatted correctly, and all additional tools are installed, insert your OPENAI_API_KEY in Prompt_to_pill.py and set the number of patients in patient_matching_mcp_server.py. Finally, run the full Prompt-to-Pill pipeline by executing Prompt_to_pill.py. After running the script, you will be prompted to enter your task and the system will then automatically execute the entire Prompt-to-Pill workflow, displaying each phase in sequence (drug generation, ADMET prediction, docking, optimization, clinical trial generation, and patient matching) directly in your terminal.
 
