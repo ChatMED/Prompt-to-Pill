@@ -81,6 +81,8 @@ Install the following tools required for the pipeline with their specific versio
 3. Open Babel: Version 3.1.1 
 4. P2Rank: Version 2.5.1
 
+You can check the enviorment setup by running check_env.py script
+
 ## ▶️ Running the Workflow
 
 Once all MCP servers are launched (for Panacea-dependent servers, GPU is required), the patient data are formatted correctly, and all additional tools are installed, insert your OPENAI_API_KEY in Prompt_to_pill.py and set the number of patients in patient_matching_mcp_server.py. Finally, run the full Prompt-to-Pill pipeline by executing Prompt_to_pill.py. After running the script, you will be prompted to enter your task and the system will then automatically execute the entire Prompt-to-Pill workflow, displaying each phase in sequence (drug generation, ADMET prediction, docking, optimization, clinical trial generation, and patient matching) directly in your terminal.
