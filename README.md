@@ -44,18 +44,26 @@ patient2trial/patient_topic_expansion.py
 From the repository:
  https://github.com/surdatta/patient2trial
 
-These descriptions serve as input to the matching model, which compares patient profiles against generated trial protocols to assess eligibility and similarity.
+These descriptions serve as input to the matching model, which compares patient profiles against generated trial protocols to assess eligibility and similarity. diabetes_patients_final.xml is example for the EHR format.
 
-## 🛠️ Additional Tools
-To run this pipeline, the following repositories, models, and tools are required in the workspace:
-Repositories
-Clone the following repositories into your workspace:
+## 🛠️ Enviorment setup
+Python 3.11 is needed. First clone this repository and install requierments:
+
+```bash
+git clone https://github.com/ChatMED/Prompt-to-Pill
+cd Prompt-to-Pill
+pip install -r requirements.txt
+pip install -U llama-cpp-python
+```
+
+Then clone additional repositories:
 
 ```bash
 git clone https://github.com/mahsasheikh/DrugGen.git
 git clone https://github.com/RyanWangZf/MediTab.git
 ```
-Panacea-7B-Chat: Download from Hugging Face using the following Python code:
+
+Download Panacea model Panacea-7B-Chat: Download from Hugging Face using the following Python code:
 
 ```python
 from huggingface_hub import snapshot_download
@@ -71,20 +79,9 @@ Install the following tools required for the pipeline with their specific versio
 1. AutoDock Vina: Version 1.1.2
 2. MGLTools: Version 1.5.7
 3. Open Babel: Version 3.1.1 
-4. P2Rank: Version 2.5.1 
-
-## 📋 Requirements
-
-Python 3.11 is needed. Install Python dependencies:
-```bash 
-pip install -r requirements.txt
-pip install -U llama-cpp-python
-```
+4. P2Rank: Version 2.5.1
 
 ## ▶️ Running the Workflow
 
-Once all MCP servers are launched(for panacea-dependend servers, gpu is required), Patients are in right format, additional tools are installed, run the full pipeline with:
-```Bash
-python Prompt-to-pill.py
-```
+Once all MCP servers are launched (for Panacea-dependent servers, GPU is required), the patients are formatted correctly, and all additional tools are installed, insert your OPENAI_API_KEY in Prompt_to_pill.py and set the number of patients in patient_matching_mcp_server.py. Finally, run the full Prompt-to-Pill pipeline by executing Prompt_to_pill.py. After running the script, you will be prompted to enter your task and the system will then automatically execute the entire Prompt-to-Pill workflow, displaying each phase in sequence (drug generation, ADMET prediction, docking, optimization, clinical trial generation, and patient matching) directly in your terminal.
 
