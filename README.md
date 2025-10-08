@@ -77,9 +77,8 @@ snapshot_download(
 
 Install the following tools required for the pipeline with their specific versions:
 1. AutoDock Vina: Version 1.1.2
-2. MGLTools: Version 1.5.7
-3. Open Babel: Version 3.1.1 
-4. P2Rank: Version 2.5.1
+2. Open Babel: Version 3.1.1 
+3. P2Rank: Version 2.5.1
 
 You can check the enviorment setup by running check_env.py script
 
