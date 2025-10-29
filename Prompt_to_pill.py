@@ -194,24 +194,23 @@ async def main():
         max_output_tokens=1500
     )
 
-    try:
-        druggen_tools = await mcp_server_tools(StdioServerParams(
+    druggen_tools = await mcp_server_tools(StdioServerParams(
             command="python", args=["druggen_mcp_server.py"], read_timeout_seconds=600))
-        docking_tools = await mcp_server_tools(StdioServerParams(
+    docking_tools = await mcp_server_tools(StdioServerParams(
             command="python", args=["docking_mcp_server.py"], read_timeout_seconds=1800))
-        chemical_properties_tools = await mcp_server_tools(StdioServerParams(
+    chemical_properties_tools = await mcp_server_tools(StdioServerParams(
             command="python", args=["chemical_properties_mcp_server.py"], read_timeout_seconds=1500))
-        admet_properties_tools = await mcp_server_tools(StdioServerParams(
+    admet_properties_tools = await mcp_server_tools(StdioServerParams(
             command="python", args=["admet_prediction_mcp_server.py"], read_timeout_seconds=1500))
-        name_tools = await mcp_server_tools(
+    name_tools = await mcp_server_tools(
             StdioServerParams(command="python", args=["name2smiles_mcp_server.py"], read_timeout_seconds=150))
-        optimization_tools = await mcp_server_tools(
+    optimization_tools = await mcp_server_tools(
             StdioServerParams(command="python", args=["mol_opt_mcp_server.py"], read_timeout_seconds=1500))
-        panacea_patient_tools = await mcp_server_tools(
+    panacea_patient_tools = await mcp_server_tools(
             StdioServerParams(command="python", args=["patient_matching_mcp_server.py"], read_timeout_seconds=3000))
-        panacea_trial_tools = await mcp_server_tools(
+    panacea_trial_tools = await mcp_server_tools(
             StdioServerParams(command="python", args=["trialgen_mcp_server.py"], read_timeout_seconds=3000))
-        meditab_tools = await mcp_server_tools(
+    meditab_tools = await mcp_server_tools(
             StdioServerParams(command="python", args=["trialpred_mcp_server.py"], read_timeout_seconds=3000))
     planning_agent = AssistantAgent(
         name="planning_agent",
