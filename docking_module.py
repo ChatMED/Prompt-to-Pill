@@ -156,16 +156,6 @@ def _p2rank_base_dir() -> Path:
         p = Path(env)
         if p.exists():
             return p
-    fallbacks = [
-        r"C:\Users\ivana\PycharmProjects\Prompt_to_pill_Simulator\p2rank_2.5.1",
-        r"C:\p2rank_2.5.1",
-        "/opt/p2rank_2.5.1",
-        "/usr/local/p2rank_2.5.1",
-    ]
-    for fb in fallbacks:
-        p = Path(fb)
-        if p.exists():
-            return p
     raise RuntimeError(
         "P2Rank base directory not found. Set P2RANK_PATH to the P2Rank folder "
         "(the folder that contains pranker/prank/pranker.bat)."
