@@ -324,7 +324,8 @@ CLINICAL TRIAL:
         When assigning tasks, use this format:
         1. <agent> : <task>
 
-        After all tasks are complete, the required tools are executed, or if any step fails and no further progress is possible, output the final report.
+        After all tasks are complete, the required tools are executed, or if any step fails and no further progress is possible, output the final report and terminate the process with FINAL. DO NOT
+        word "FINAL" or use any other variation with word "FINAL" in any other plan explanation except for terminating process.
         """
     )
 
