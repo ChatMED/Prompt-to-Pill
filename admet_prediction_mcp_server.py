@@ -14,7 +14,7 @@ for name in ("gradio_client", "httpx", "urllib3"):
     logging.getLogger(name).setLevel(logging.ERROR)
 
 
-SPACE_ID = "ChemFM/molecular_property_prediction"
+SPACE_ID = "ChemFM/molecular_property_prediction_zero_gpu"
 
 
 
